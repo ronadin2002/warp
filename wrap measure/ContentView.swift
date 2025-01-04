@@ -442,22 +442,24 @@ struct ContentView: View {
                     
                     Spacer()
                     
-                    Button(action: {
-                        if let lastMeasurement = measurementManager.measurements.last,
-                           let activePallet = pallets.last {
-                            activePallet.length = lastMeasurement.length
-                            activePallet.width = lastMeasurement.width
-                            activePallet.height = lastMeasurement.height
+                    if !measurementManager.isScanning {
+                        Button(action: {
+                            if let lastMeasurement = measurementManager.measurements.last,
+                               let activePallet = pallets.last {
+                                activePallet.length = lastMeasurement.length
+                                activePallet.width = lastMeasurement.width
+                                activePallet.height = lastMeasurement.height
+                            }
+                            showingMeasurement = false
+                        }) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.title)
+                                .foregroundColor(.green)
+                                .padding()
                         }
-                        showingMeasurement = false
-                    }) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.title)
-                            .foregroundColor(.green)
-                            .padding()
+                        .opacity(measurementManager.measurements.isEmpty ? 0.5 : 1)
+                        .disabled(measurementManager.measurements.isEmpty)
                     }
-                    .opacity(measurementManager.measurements.isEmpty ? 0.5 : 1)
-                    .disabled(measurementManager.measurements.isEmpty)
                 }
                 
                 Text(measurementManager.messageText)
@@ -466,10 +468,35 @@ struct ContentView: View {
                     .cornerRadius(8)
                     .padding(.top)
                 
+                if measurementManager.isScanning {
+                    ProgressView(value: measurementManager.scanningProgress) {
+                        Text("Scanning Progress")
+                    }
+                    .progressViewStyle(LinearProgressViewStyle())
+                    .padding()
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(8)
+                }
+                
                 Spacer()
                 
-                MeasurementInfoView(measurements: measurementManager.measurements)
+                if !measurementManager.isScanning {
+                    MeasurementInfoView(measurements: measurementManager.measurements)
+                        .padding()
+                }
+                
+                if measurementManager.measurements.isEmpty && !measurementManager.isScanning {
+                    Button(action: {
+                        measurementManager.startScanning()
+                    }) {
+                        Text("Start Scanning")
+                            .foregroundColor(.white)
+                            .padding()
+                            .background(Color.blue)
+                            .cornerRadius(8)
+                    }
                     .padding()
+                }
             }
         }
     }
@@ -541,6 +568,10 @@ struct ARViewContainer: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: ARView, context: Context) {}
+    
+    static func dismantleUIView(_ uiView: ARView, coordinator: ()) {
+        uiView.session.pause()
+    }
 }
 
 struct MeasurementInfoView: View {
@@ -585,137 +616,336 @@ struct DimensionBox: View {
 
 class MeasurementManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var measurements: [Measurement] = []
-    @Published var messageText: String = "Tap first corner"
+    @Published var messageText: String = "Move around the object to start scanning"
+    @Published var scanningProgress: Float = 0.0
+    @Published var isScanning: Bool = false
+    @Published var scanningState: ScanningState = .initial
+    
     private var arView: ARView?
     private var measurementAnchors: [AnchorEntity] = []
-    private var points: [simd_float3] = []
+    private var boundingBox: (min: simd_float3, max: simd_float3)?
+    private var lastBoundingBox: (min: simd_float3, max: simd_float3)?
+    private var stableFrameCount: Int = 0
+    private let requiredStableFrames = 30
+    private var scanStartTime: Date?
+    private let scanTimeout = 30.0
+    private var lastUpdateTime: TimeInterval = 0
+    private var scannedSides = Set<ScanSide>()
+    private var meshVertices: [simd_float3] = []
+    private let maxVertices = 10000
+    private let stabilityThreshold: Float = 0.01
+    
+    deinit {
+        arView?.session.pause()
+    }
+    
+    enum ScanningState {
+        case initial, front, left, right, top, complete
+        
+        var message: String {
+            switch self {
+            case .initial: return "Position yourself in front of the object"
+            case .front: return "Move to the left side of the object"
+            case .left: return "Move to the right side of the object"
+            case .right: return "Move above the object"
+            case .top: return "Almost done, hold steady..."
+            case .complete: return "Scan complete!"
+            }
+        }
+    }
+    
+    enum ScanSide: String {
+        case front, left, right, top
+    }
     
     func setupAR(_ arView: ARView) {
+        // Pause any existing session
+        self.arView?.session.pause()
+        
         self.arView = arView
         
+        guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) else {
+            messageText = "This device doesn't support mesh reconstruction"
+            return
+        }
+        
         let config = ARWorldTrackingConfiguration()
+        config.sceneReconstruction = .mesh
+        config.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
         config.planeDetection = [.horizontal, .vertical]
         
-        arView.session.run(config)
         arView.session.delegate = self
+        arView.session.run(config)
+        arView.debugOptions = [.showSceneUnderstanding]
         
-        // Add tap gesture
-        let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap))
-        arView.addGestureRecognizer(tapGesture)
+        startScanning()
     }
     
-    @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        guard let arView = arView else { return }
+    func stopSession() {
+        arView?.session.pause()
+        clearAnchors()
+    }
+    
+    func startScanning() {
+        isScanning = true
+        scanStartTime = Date()
+        scanningState = .initial
+        boundingBox = nil
+        lastBoundingBox = nil
+        stableFrameCount = 0
+        scanningProgress = 0.0
+        scannedSides.removeAll()
+        meshVertices.removeAll()
+        measurements.removeAll() // Clear previous measurements
+        clearAnchors()
+        messageText = "Position yourself in front of the object" // Reset to initial message
         
-        let location = gesture.location(in: arView)
-        
-        // Perform hit test with real-world surface
-        let results = arView.raycast(from: location, allowing: .estimatedPlane, alignment: .any)
-        
-        if let firstResult = results.first {
-            let worldPosition = simd_make_float3(firstResult.worldTransform.columns.3)
-            addPoint(at: worldPosition)
+        // Reset AR session to ensure fresh start
+        if let arView = arView {
+            let config = ARWorldTrackingConfiguration()
+            config.sceneReconstruction = .mesh
+            config.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
+            config.planeDetection = [.horizontal, .vertical]
+            arView.session.run(config, options: [.removeExistingAnchors, .resetTracking])
         }
     }
     
-    private func addPoint(at position: simd_float3) {
-        points.append(position)
-        addMarker(at: position)
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        guard isScanning else { return }
         
-        switch points.count {
-        case 1:
-            messageText = "Tap second corner (width)"
-        case 2:
-            messageText = "Tap third corner (length)"
-            createMeasurementLine(from: points[0], to: points[1])
-        case 3:
-            messageText = "Tap fourth corner (height)"
-            createMeasurementLine(from: points[1], to: points[2])
-        case 4:
-            createMeasurementLine(from: points[2], to: points[3])
-            createMeasurementLine(from: points[3], to: points[0])
-            calculateBoxDimensions()
+        // Check for timeout
+        if let startTime = scanStartTime, 
+           Date().timeIntervalSince(startTime) > scanTimeout {
+            DispatchQueue.main.async {
+                self.messageText = "Scan timeout. Please try again."
+                self.isScanning = false
+            }
+            return
+        }
+        
+        // Process mesh data
+        processMeshData(frame)
+        
+        // Update scanning state using the camera transform directly
+        updateScanningState(frame.camera.transform)
+    }
+    
+    private func processMeshData(_ frame: ARFrame) {
+        let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        
+        // Process mesh vertices
+        var newVertices: [simd_float3] = []
+        
+        // Get camera position for filtering
+        let cameraPosition = simd_float3(frame.camera.transform.columns.3.x,
+                                       frame.camera.transform.columns.3.y,
+                                       frame.camera.transform.columns.3.z)
+        
+        for anchor in meshAnchors {
+            let vertices = anchor.geometry.vertices
+            let transform = anchor.transform
             
-            // Reset for next measurement
-            points.removeAll()
-            messageText = "Tap first corner"
-        default:
-            break
+            // Convert ARGeometrySource to array of points
+            let vertexPointer = vertices.buffer.contents()
+            let stride = vertices.stride
+            let count = vertices.count
+            
+            for index in 0..<count {
+                let vertexOffset = index * stride
+                let vertex = vertexPointer.advanced(by: vertexOffset)
+                    .assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                let worldPosition = simd_mul(transform, simd_float4(vertex, 1)).xyz
+                
+                // Filter points: only include points within reasonable distance from camera
+                let distanceToCamera = distance(worldPosition, cameraPosition)
+                if distanceToCamera < 1.5 { // Reduced from 2.0 to 1.5 meters for better accuracy
+                    newVertices.append(worldPosition)
+                }
+            }
+        }
+        
+        // Focus on central cluster of points
+        if !newVertices.isEmpty {
+            // Calculate center of all points
+            let center = newVertices.reduce(simd_float3(0, 0, 0), +) / Float(newVertices.count)
+            
+            // Filter points close to center (likely part of the main object)
+            newVertices = newVertices.filter { point in
+                distance(point, center) < 0.3 // Reduced from 0.5 to 0.3 meters for tighter clustering
+            }
+        }
+        
+        // Limit the number of vertices for performance
+        if newVertices.count > maxVertices {
+            let strideValue = newVertices.count / maxVertices
+            newVertices = Array(stride(from: 0, to: newVertices.count, by: max(1, strideValue))).map { newVertices[$0] }
+        }
+        
+        meshVertices = newVertices
+        
+        // Calculate new bounding box
+        if !meshVertices.isEmpty {
+            calculateBoundingBox()
         }
     }
     
-    private func calculateBoxDimensions() {
-        guard points.count == 4 else { return }
+    private func calculateBoundingBox() {
+        guard !meshVertices.isEmpty else { return }
         
-        // Calculate the three edges from the first point
-        let edge1 = points[1] - points[0] // First edge (width)
-        let edge2 = points[2] - points[1] // Second edge (length)
-        let edge3 = points[3] - points[0] // Third edge (height)
+        // Find the main cluster of points
+        let center = meshVertices.reduce(simd_float3(0, 0, 0), +) / Float(meshVertices.count)
         
-        // Calculate dimensions
-        let width = simd_length(edge1)
-        let length = simd_length(edge2)
-        let height = simd_length(edge3)
+        // Filter points that are likely part of the main object
+        let relevantVertices = meshVertices.filter { vertex in
+            distance(vertex, center) < 0.3 // Reduced from 0.5 to 0.3 meters for tighter clustering
+        }
         
-        // Convert to inches
+        guard !relevantVertices.isEmpty else { return }
+        
+        // Calculate bounds for filtered points
+        let minX = relevantVertices.min { $0.x < $1.x }?.x ?? 0
+        let minY = relevantVertices.min { $0.y < $1.y }?.y ?? 0
+        let minZ = relevantVertices.min { $0.z < $1.z }?.z ?? 0
+        let maxX = relevantVertices.max { $0.x < $1.x }?.x ?? 0
+        let maxY = relevantVertices.max { $0.y < $1.y }?.y ?? 0
+        let maxZ = relevantVertices.max { $0.z < $1.z }?.z ?? 0
+        
+        let newMin = simd_float3(minX, minY, minZ)
+        let newMax = simd_float3(maxX, maxY, maxZ)
+        
+        // Apply minimum size threshold to avoid tiny measurements
+        let minSize: Float = 0.03 // Reduced from 0.05 to 0.03 meters (about 1 inch minimum)
+        if (newMax - newMin).x < minSize || (newMax - newMin).y < minSize || (newMax - newMin).z < minSize {
+            return
+        }
+        
+        // Check for bounding box stability
+        if let lastBox = lastBoundingBox {
+            let minDiff = distance(newMin, lastBox.min)
+            let maxDiff = distance(newMax, lastBox.max)
+            
+            if minDiff < stabilityThreshold && maxDiff < stabilityThreshold {
+                stableFrameCount += 1
+                if stableFrameCount >= requiredStableFrames {
+                    completeScan()
+                }
+            } else {
+                stableFrameCount = 0
+            }
+        }
+        
+        lastBoundingBox = (newMin, newMax)
+        boundingBox = (newMin, newMax)
+    }
+    
+    private func updateScanningState(_ cameraTransform: simd_float4x4) {
+        guard let boundingBox = boundingBox else { 
+            scanningState = .initial
+            messageText = "Position yourself in front of the object"
+            return 
+        }
+        
+        let center = (boundingBox.max + boundingBox.min) * 0.5
+        let cameraPosition = simd_float3(cameraTransform.columns.3.x,
+                                       cameraTransform.columns.3.y,
+                                       cameraTransform.columns.3.z)
+        let toCamera = normalize(cameraPosition - center)
+        
+        // Always check sides in the same order
+        if !scannedSides.contains(.front) {
+            if abs(toCamera.z) > 0.7 {
+                scannedSides.insert(.front)
+                scanningState = .left
+            } else {
+                scanningState = .initial
+            }
+        } else if !scannedSides.contains(.left) {
+            if toCamera.x < -0.7 {
+                scannedSides.insert(.left)
+                scanningState = .right
+            }
+        } else if !scannedSides.contains(.right) {
+            if toCamera.x > 0.7 {
+                scannedSides.insert(.right)
+                scanningState = .top
+            }
+        } else if !scannedSides.contains(.top) {
+            if toCamera.y > 0.7 {
+                scannedSides.insert(.top)
+                scanningState = .complete
+            }
+        }
+        
+        scanningProgress = Float(scannedSides.count) / 4.0
+        messageText = scanningState.message
+    }
+    
+    private func completeScan() {
+        guard let boundingBox = boundingBox,
+              !measurements.contains(where: { _ in true }) else { return }
+        
+        let dimensions = boundingBox.max - boundingBox.min
+        
+        // Ensure correct dimension mapping based on orientation
+        let sortedDimensions = [
+            dimensions.x,
+            dimensions.y,
+            dimensions.z
+        ].sorted(by: >)
+        
+        // Map dimensions to length, width, height based on size
         let measurement = Measurement(
-            length: Double(metersToInches(length)),
-            width: Double(metersToInches(width)),
-            height: Double(metersToInches(height))
+            length: Double(metersToInches(sortedDimensions[0])), // Longest dimension
+            width: Double(metersToInches(sortedDimensions[1])),  // Second longest
+            height: Double(metersToInches(sortedDimensions[2]))  // Shortest (usually height)
         )
         
-        measurements.append(measurement)
+        DispatchQueue.main.async {
+            self.measurements.append(measurement)
+            self.isScanning = false
+            self.messageText = "Scan complete! Tap checkmark to save measurements."
+            self.scanningProgress = 1.0
+            self.visualizeBoundingBox(min: boundingBox.min, max: boundingBox.max)
+            self.stopSession() // Stop the session after completing the scan
+        }
     }
     
-    private func metersToInches(_ meters: Float) -> Float {
-        return meters * 39.3701 // Convert meters to inches
-    }
-    
-    private func addMarker(at position: simd_float3) {
+    private func visualizeBoundingBox(min: simd_float3, max: simd_float3) {
         guard let arView = arView else { return }
         
-        // Create a small sphere to mark the point
-        let sphere = ModelEntity(mesh: .generateSphere(radius: 0.01),
-                               materials: [SimpleMaterial(color: .blue, isMetallic: true)])
-        
-        let anchor = AnchorEntity(world: position)
-        anchor.addChild(sphere)
-        
-        arView.scene.addAnchor(anchor)
-        measurementAnchors.append(anchor)
-    }
-    
-    private func createMeasurementLine(from start: simd_float3, to end: simd_float3) {
-        guard let arView = arView else { return }
-        
-        let distance = simd_distance(start, end)
-        let inches = metersToInches(distance)
-        
-        // Create line
-        let lineMesh = MeshResource.generateBox(size: [distance, 0.002, 0.002])
+        // Create wireframe box
+        let dimensions = max - min
+        let boxMesh = MeshResource.generateBox(size: dimensions)
         var material = SimpleMaterial()
-        material.color = .init(tint: .white.withAlphaComponent(0.8))
-        let lineEntity = ModelEntity(mesh: lineMesh, materials: [material])
+        material.color = .init(tint: .blue.withAlphaComponent(0.3))
+        let boxEntity = ModelEntity(mesh: boxMesh, materials: [material])
         
-        // Position and rotate line
-        let midPoint = (start + end) / 2
-        let anchor = AnchorEntity(world: midPoint)
+        // Position at center of bounding box
+        let center = (min + max) * 0.5
+        let anchor = AnchorEntity(world: center)
+        anchor.addChild(boxEntity)
         
-        // Calculate rotation to point from start to end
-        let direction = normalize(end - start)
-        let rotation = simd_quatf(from: [1, 0, 0], to: direction)
-        lineEntity.orientation = rotation
+        // Add dimension labels
+        let inches = simd_float3(
+            metersToInches(dimensions.x),
+            metersToInches(dimensions.y),
+            metersToInches(dimensions.z)
+        )
         
-        // Add dimension label
-        let dimensionText = String(format: "%.1f\"", inches)
-        let textEntity = createMeasurementText(dimensionText)
-        textEntity.position = [0, 0.02, 0]
-        
-        anchor.addChild(lineEntity)
+        // Add dimension text
+        let textEntity = createMeasurementText(
+            String(format: "%.1f\" x %.1f\" x %.1f\"",
+                  inches.x, inches.y, inches.z)
+        )
+        textEntity.position = [0, dimensions.y/2 + 0.05, 0]
         anchor.addChild(textEntity)
         
         arView.scene.addAnchor(anchor)
         measurementAnchors.append(anchor)
+    }
+    
+    private func metersToInches(_ meters: Float) -> Float {
+        return meters * 39.3701 // Convert meters to inches
     }
     
     private func createMeasurementText(_ text: String) -> ModelEntity {
@@ -735,13 +965,22 @@ class MeasurementManager: NSObject, ObservableObject, ARSessionDelegate {
     }
     
     private func clearAnchors() {
-        measurementAnchors.forEach { $0.removeFromParent() }
+        for anchor in measurementAnchors {
+            anchor.removeFromParent()
+        }
         measurementAnchors.removeAll()
     }
-    
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // Not needed for manual measurement
+}
+
+private extension simd_float4 {
+    var xyz: simd_float3 {
+        return simd_float3(x, y, z)
     }
+}
+
+private func distance(_ a: simd_float3, _ b: simd_float3) -> Float {
+    let diff = a - b
+    return sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z)
 }
 
 struct Measurement: Identifiable {
